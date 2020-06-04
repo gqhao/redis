@@ -2420,6 +2420,107 @@ cleanup:
     sdsfreesplitres(token,numtokens);
 }
 
+void htp_add_sentinels(char *hello, int hello_len) {
+    /* Format is composed of 8 tokens:
+     * 0=ip,1=port,2=runid,3=current_epoch,4=master_name,
+     * 5=master_ip,6=master_port,7=master_config_epoch. */
+    int numtokens, port, removed, master_port;
+    uint64_t current_epoch, master_config_epoch;
+    char **token = sdssplitlen(hello, hello_len, ",", 1, &numtokens);
+    sentinelRedisInstance *si, *master;
+
+    if (numtokens == 8) {
+        /* Obtain a reference to the master this hello message is about */
+        master = sentinelGetMasterByName(token[4]);
+        if (!master) goto cleanup; /* Unknown master, skip the message. */
+
+        /* First, try to see if we already have this sentinel. */
+        port = atoi(token[1]);
+        master_port = atoi(token[6]);
+        si = getSentinelRedisInstanceByAddrAndRunID(
+                        master->sentinels,token[0],port,token[2]);
+        current_epoch = strtoull(token[3],NULL,10);
+        master_config_epoch = strtoull(token[7],NULL,10);
+
+        if (!si) {
+            /* If not, remove all the sentinels that have the same runid
+             * because there was an address change, and add the same Sentinel
+             * with the new address back. */
+            removed = removeMatchingSentinelFromMaster(master,token[2]);
+            if (removed) {
+                sentinelEvent(LL_NOTICE,"+sentinel-address-switch",master,
+                    "%@ ip %s port %d for %s", token[0],port,token[2]);
+            } else {
+                /* Check if there is another Sentinel with the same address this
+                 * new one is reporting. What we do if this happens is to set its
+                 * port to 0, to signal the address is invalid. We'll update it
+                 * later if we get an HELLO message. */
+                sentinelRedisInstance *other =
+                    getSentinelRedisInstanceByAddrAndRunID(
+                        master->sentinels, token[0],port,NULL);
+                if (other) {
+                    sentinelEvent(LL_NOTICE,"+sentinel-invalid-addr",other,"%@");
+                    other->addr->port = 0; /* It means: invalid address. */
+                    sentinelUpdateSentinelAddressInAllMasters(other);
+                }
+            }
+
+            /* Add the new sentinel. */
+            si = createSentinelRedisInstance(token[2],SRI_SENTINEL,
+                            token[0],port,master->quorum,master);
+
+            if (si) {
+                if (!removed) sentinelEvent(LL_NOTICE,"+sentinel",si,"%@");
+                /* The runid is NULL after a new instance creation and
+                 * for Sentinels we don't have a later chance to fill it,
+                 * so do it now. */
+                si->runid = sdsnew(token[2]);
+                sentinelTryConnectionSharing(si);
+                if (removed) sentinelUpdateSentinelAddressInAllMasters(si);
+                sentinelFlushConfig();
+            }
+        }
+
+        /* Update local current_epoch if received current_epoch is greater.*/
+        if (current_epoch > sentinel.current_epoch) {
+            sentinel.current_epoch = current_epoch;
+            sentinelFlushConfig();
+            sentinelEvent(LL_WARNING,"+new-epoch",master,"%llu",
+                (unsigned long long) sentinel.current_epoch);
+        }
+
+        /* Update master info if received configuration is newer. */
+        if (si && master->config_epoch < master_config_epoch) {
+            master->config_epoch = master_config_epoch;
+            if (master_port != master->addr->port ||
+                strcmp(master->addr->ip, token[5]))
+            {
+                sentinelAddr *old_addr;
+
+                sentinelEvent(LL_WARNING,"+config-update-from",si,"%@");
+                sentinelEvent(LL_WARNING,"+switch-master",
+                    master,"%s %s %d %s %d",
+                    master->name,
+                    master->addr->ip, master->addr->port,
+                    token[5], master_port);
+
+                old_addr = dupSentinelAddr(master->addr);
+                sentinelResetMasterAndChangeAddress(master, token[5], master_port);
+                sentinelCallClientReconfScript(master,
+                    SENTINEL_OBSERVER,"start",
+                    old_addr,master->addr);
+                releaseSentinelAddr(old_addr);
+            }
+        }
+
+        /* Update the state of the Sentinel. */
+        if (si) si->last_hello_time = mstime();
+    }
+
+cleanup:
+    sdsfreesplitres(token,numtokens);
+}
+
 
 /* This is our Pub/Sub callback for the Hello channel. It's useful in order
  * to discover other sentinels attached at the same master. */
@@ -4279,7 +4380,7 @@ void sentinelHandleDictOfRedisInstances(dict *instances) {
 
         sentinelHandleRedisInstance(ri);
         if (ri->flags & SRI_MASTER) {
-            sentinelHandleDictOfRedisInstances(ri->slaves);
+          //            sentinelHandleDictOfRedisInstances(ri->slaves);
             sentinelHandleDictOfRedisInstances(ri->sentinels);
             if (ri->failover_state == SENTINEL_FAILOVER_STATE_UPDATE_CONFIG) {
                 switch_to_promoted = ri;
